@@ -1,4 +1,4 @@
-```markdown
+
 # Blogger Web Crawler in Go
 
 A concurrent web crawler that extracts post titles, embedded video URLs, and tags from Google Blogger sites, saving results to a CSV file.
