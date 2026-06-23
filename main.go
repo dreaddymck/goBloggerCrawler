@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -13,7 +17,8 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
-// Post represents the data structure for a blog post
+// Post represents the data structure for a blog post, regardless of
+// whether it was retrieved via the Blogger v3 API or HTML crawling.
 type Post struct {
 	Title    string
 	VideoURL string
@@ -22,36 +27,74 @@ type Post struct {
 
 // Constants
 const (
-	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-	maxRetries = 3
-	workers    = 5 // Number of concurrent workers for crawling
-	timeout    = 10 * time.Second
+	userAgent         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+	maxRetries        = 3
+	crawlWorkers      = 5 // Concurrent workers for HTML crawl mode only
+	requestTimeout    = 10 * time.Second
+	defaultMaxResults = 500 // Blogger API page size cap
+	bloggerAPIBase    = "https://www.googleapis.com/blogger/v3"
 )
 
-var (
-	httpClient = &http.Client{
-		Timeout: timeout,
-	}
-)
+var httpClient = &http.Client{Timeout: requestTimeout}
 
-// fetchURL fetches the HTML content of a given URL
-func fetchURL(url string) (*goquery.Document, error) {
-	req, err := http.NewRequest("GET", url, nil)
+// ---------------------------------------------------------------------------
+// Blogger v3 API types
+// ---------------------------------------------------------------------------
+
+type apiBlog struct {
+	ID string `json:"id"`
+}
+
+type apiPost struct {
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Labels  []string `json:"labels"`
+	URL     string   `json:"url"`
+}
+
+type apiPostList struct {
+	Items         []apiPost `json:"items"`
+	NextPageToken string    `json:"nextPageToken"`
+}
+
+// ---------------------------------------------------------------------------
+// Shared HTTP helpers
+// ---------------------------------------------------------------------------
+
+// doWithRetry performs a GET request with retry + exponential backoff,
+// returning the response only on an actual 200 OK. Unlike the old
+// implementation, a non-200 status is treated as a failure and retried
+// instead of being silently parsed as if it succeeded.
+func doWithRetry(targetURL string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %v", err)
 	}
 	req.Header.Set("User-Agent", userAgent)
 
 	var resp *http.Response
+	var lastErr error
 	for retry := 0; retry < maxRetries; retry++ {
-		resp, err = httpClient.Do(req)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			break
+		resp, lastErr = httpClient.Do(req)
+		if lastErr == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		if lastErr == nil {
+			// Got a response, just not a 200 — drain/close before retrying.
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 		time.Sleep(time.Second * time.Duration(retry+1)) // Exponential backoff
 	}
+	return nil, fmt.Errorf("error fetching %s after %d attempts: %v", targetURL, maxRetries, lastErr)
+}
+
+// fetchHTML fetches and parses a page as an HTML document (used by crawl mode).
+func fetchHTML(targetURL string) (*goquery.Document, error) {
+	resp, err := doWithRetry(targetURL)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching URL: %v", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -62,71 +105,125 @@ func fetchURL(url string) (*goquery.Document, error) {
 	return doc, nil
 }
 
-// extractPostData extracts the title, video URL, and tags from a post page
-func extractPostData(url string) (Post, error) {
-	doc, err := fetchURL(url)
+// fetchJSON fetches a URL and decodes the JSON body into out (used by API mode).
+func fetchJSON(targetURL string, out interface{}) error {
+	resp, err := doWithRetry(targetURL)
 	if err != nil {
-		return Post{}, fmt.Errorf("error fetching post page: %v", err)
+		return err
 	}
-
-	// Debug: Print the HTML of the post page
-	// html, _ := doc.Html()
-	// log.Printf("Post page HTML: %s\n", html)
-
-	// Extract title
-	title := doc.Find("h3.post-title").First().Text() // Updated selector
-
-	// Extract video URL (assuming it's in an iframe)
-	videoURL, _ := doc.Find("iframe").First().Attr("src")
-
-	// Extract tags (labels)
-	var tags []string
-	doc.Find("span.post-labels a").Each(func(i int, s *goquery.Selection) { // Updated selector
-		tags = append(tags, strings.TrimSpace(s.Text()))
-	})
-
-	return Post{
-		Title:    strings.TrimSpace(title),
-		VideoURL: strings.TrimSpace(videoURL),
-		Tags:     tags,
-	}, nil
+	defer resp.Body.Close()
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// crawlPage crawls a single page and extracts post URLs
-func crawlPage(url string, postChan chan<- string, wg *sync.WaitGroup) {
+// extractVideoFromHTML pulls the first <iframe src> out of a post's HTML
+// body. This replaces the old "fetch the post page and find an iframe"
+// step — the API already gives us the body, so this is just local parsing.
+func extractVideoFromHTML(htmlContent string) string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
+	if err != nil {
+		return ""
+	}
+	src, _ := doc.Find("iframe").First().Attr("src")
+	return strings.TrimSpace(src)
+}
+
+// ---------------------------------------------------------------------------
+// Primary path: Blogger v3 API
+// ---------------------------------------------------------------------------
+
+// resolveBlogID looks up a blog's numeric ID from its public URL.
+func resolveBlogID(baseURL, apiKey string) (string, error) {
+	lookupURL := fmt.Sprintf("%s/blogs/byurl?url=%s&key=%s",
+		bloggerAPIBase, url.QueryEscape(baseURL), url.QueryEscape(apiKey))
+
+	var blog apiBlog
+	if err := fetchJSON(lookupURL, &blog); err != nil {
+		return "", fmt.Errorf("resolving blog ID for %s: %v", baseURL, err)
+	}
+	if blog.ID == "" {
+		return "", fmt.Errorf("no blog found for URL %s (check the URL and API key)", baseURL)
+	}
+	return blog.ID, nil
+}
+
+// crawlViaAPI is the new primary path: paginate Blogger v3's posts.list
+// endpoint and build Post records directly from the structured response.
+func crawlViaAPI(baseURL, apiKey, outputFile string, maxResults int) error {
+	if apiKey == "" {
+		return fmt.Errorf("API mode requires an API key (-apikey flag or BLOGGER_API_KEY env var)")
+	}
+
+	blogID, err := resolveBlogID(baseURL, apiKey)
+	if err != nil {
+		return err
+	}
+	log.Printf("Resolved blog ID %s for %s", blogID, baseURL)
+
+	var posts []Post
+	pageToken := ""
+
+	for {
+		listURL := fmt.Sprintf("%s/blogs/%s/posts?key=%s&maxResults=%d&fetchBodies=true",
+			bloggerAPIBase, blogID, url.QueryEscape(apiKey), maxResults)
+		if pageToken != "" {
+			listURL += "&pageToken=" + url.QueryEscape(pageToken)
+		}
+
+		var page apiPostList
+		if err := fetchJSON(listURL, &page); err != nil {
+			return fmt.Errorf("error fetching posts page: %v", err)
+		}
+
+		for _, item := range page.Items {
+			posts = append(posts, Post{
+				Title:    strings.TrimSpace(item.Title),
+				VideoURL: extractVideoFromHTML(item.Content),
+				Tags:     item.Labels,
+			})
+		}
+		log.Printf("Fetched %d posts (running total: %d)", len(page.Items), len(posts))
+
+		if page.NextPageToken == "" {
+			break
+		}
+		pageToken = page.NextPageToken
+	}
+
+	return writeToCSV(posts, outputFile)
+}
+
+// ---------------------------------------------------------------------------
+// Fallback path: HTML crawling (formerly the only behavior)
+// ---------------------------------------------------------------------------
+
+// crawlPage crawls a single listing page and extracts post URLs, then
+// recurses into the "Older Posts" link if one exists.
+func crawlPage(pageURL string, postChan chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	doc, err := fetchURL(url)
+	doc, err := fetchHTML(pageURL)
 	if err != nil {
-		log.Printf("error crawling page %s: %v", url, err)
+		log.Printf("error crawling page %s: %v", pageURL, err)
 		return
 	}
 
-	// Debug: Print the HTML of the page
-	// html, _ := doc.Html()
-	// log.Printf("Page HTML: %s\n", html)
-
-	// Extract post URLs
-	doc.Find("h3.post-title a").Each(func(i int, s *goquery.Selection) { // Updated selector
+	doc.Find("h3.post-title a").Each(func(i int, s *goquery.Selection) {
 		postURL, exists := s.Attr("href")
 		if exists {
-			// Ensure the post URL is absolute
 			if !strings.HasPrefix(postURL, "http") {
-				postURL = url + postURL
+				postURL = pageURL + postURL
 			}
 			log.Printf("Found post: %s", postURL)
 			postChan <- postURL
 		}
 	})
 
-	// Find the "More Posts" link and crawl the next page
 	nextPageLink := doc.Find("a.blog-pager-older-link")
 	if nextPageLink.Length() > 0 {
 		nextPageURL, exists := nextPageLink.Attr("href")
 		if exists {
-			// Ensure the next page URL is absolute
 			if !strings.HasPrefix(nextPageURL, "http") {
-				nextPageURL = url + nextPageURL
+				nextPageURL = pageURL + nextPageURL
 			}
 			log.Printf("Found next page: %s", nextPageURL)
 			wg.Add(1)
@@ -137,10 +234,31 @@ func crawlPage(url string, postChan chan<- string, wg *sync.WaitGroup) {
 	}
 }
 
-// worker processes post URLs and extracts data
+// extractPostData scrapes title/video/tags from a single post page's HTML.
+func extractPostData(postURL string) (Post, error) {
+	doc, err := fetchHTML(postURL)
+	if err != nil {
+		return Post{}, fmt.Errorf("error fetching post page: %v", err)
+	}
+
+	title := doc.Find("h3.post-title").First().Text()
+	videoURL, _ := doc.Find("iframe").First().Attr("src")
+
+	var tags []string
+	doc.Find("span.post-labels a").Each(func(i int, s *goquery.Selection) {
+		tags = append(tags, strings.TrimSpace(s.Text()))
+	})
+
+	return Post{
+		Title:    strings.TrimSpace(title),
+		VideoURL: strings.TrimSpace(videoURL),
+		Tags:     tags,
+	}, nil
+}
+
+// worker processes post URLs and extracts data (HTML crawl mode only).
 func worker(postChan <-chan string, resultsChan chan<- Post, wg *sync.WaitGroup) {
 	defer wg.Done()
-
 	for postURL := range postChan {
 		post, err := extractPostData(postURL)
 		if err != nil {
@@ -151,64 +269,22 @@ func worker(postChan <-chan string, resultsChan chan<- Post, wg *sync.WaitGroup)
 	}
 }
 
-// writeToCSV writes the collected posts to a CSV file
-func writeToCSV(posts []Post, filename string) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("error creating CSV file: %v", err)
-	}
-	defer file.Close()
+// crawlViaHTML is the original behavior, now opt-in via -mode=crawl.
+func crawlViaHTML(baseURL, outputFile string) error {
+	postChan := make(chan string, 100)
+	resultsChan := make(chan Post, 100)
 
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// Write header
-	header := []string{"Title", "Video URL", "Tags"}
-	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("error writing CSV header: %v", err)
-	}
-
-	// Write rows
-	for _, post := range posts {
-		row := []string{post.Title, post.VideoURL, strings.Join(post.Tags, ", ")}
-		if err := writer.Write(row); err != nil {
-			return fmt.Errorf("error writing CSV row: %v", err)
-		}
-	}
-
-	return nil
-}
-
-func main() {
-	// Check for required command-line arguments
-	if len(os.Args) < 3 {
-		log.Fatalf("Usage: %s <baseURL> <outputFile>\nExample: %s https://iandiwatching.blogspot.com posts.csv", os.Args[0], os.Args[0])
-	}
-
-	baseURL := os.Args[1]
-	outputFile := os.Args[2]
-
-	startTime := time.Now()
-
-	// Channels for communication
-	postChan := make(chan string, 100)  // Buffered channel for post URLs
-	resultsChan := make(chan Post, 100) // Buffered channel for post data
-
-	// WaitGroups for synchronization
 	var crawlerWg sync.WaitGroup
 	var workerWg sync.WaitGroup
 
-	// Start crawling the initial page
 	crawlerWg.Add(1)
 	go crawlPage(baseURL, postChan, &crawlerWg)
 
-	// Start worker goroutines
-	for i := 0; i < workers; i++ {
+	for i := 0; i < crawlWorkers; i++ {
 		workerWg.Add(1)
 		go worker(postChan, resultsChan, &workerWg)
 	}
 
-	// Collect results in a separate goroutine
 	var posts []Post
 	var resultsWg sync.WaitGroup
 	resultsWg.Add(1)
@@ -219,21 +295,92 @@ func main() {
 		}
 	}()
 
-	// Wait for all crawlers to finish
 	crawlerWg.Wait()
-	close(postChan) // Close postChan to signal workers to exit
-
-	// Wait for all workers to finish
+	close(postChan)
 	workerWg.Wait()
-	close(resultsChan) // Close resultsChan to signal results collector to exit
-
-	// Wait for results collector to finish
+	close(resultsChan)
 	resultsWg.Wait()
 
-	// Write results to CSV
-	if err := writeToCSV(posts, outputFile); err != nil {
-		log.Fatalf("error writing to CSV: %v", err)
+	return writeToCSV(posts, outputFile)
+}
+
+// ---------------------------------------------------------------------------
+// CSV output (shared by both modes)
+// ---------------------------------------------------------------------------
+
+func writeToCSV(posts []Post, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("error creating CSV file: %v", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	header := []string{"Title", "Video URL", "Tags"}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("error writing CSV header: %v", err)
 	}
 
-	log.Printf("Crawling completed in %v. Total posts: %d", time.Since(startTime), len(posts))
+	for _, post := range posts {
+		row := []string{post.Title, post.VideoURL, strings.Join(post.Tags, ", ")}
+		if err := writer.Write(row); err != nil {
+			return fmt.Errorf("error writing CSV row: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+func main() {
+	mode := flag.String("mode", "api", `Retrieval mode: "api" (Blogger v3 API, default) or "crawl" (legacy HTML scraping fallback)`)
+	apiKey := flag.String("apikey", os.Getenv("BLOGGER_API_KEY"), "Blogger v3 API key (required for -mode=api; defaults to $BLOGGER_API_KEY)")
+	baseURLFlag := flag.String("baseurl", "", "Base URL of the Blogger site (e.g. https://yoursitename.blogspot.com)")
+	outputFlag := flag.String("output", "", "CSV output filename")
+	maxResults := flag.Int("maxresults", defaultMaxResults, "Posts per page when using -mode=api (max 500)")
+	flag.Parse()
+
+	// Backward compatibility: allow positional args <baseURL> <outputFile>
+	// just like the original tool, in case anything still calls it that way.
+	args := flag.Args()
+	baseURL := *baseURLFlag
+	outputFile := *outputFlag
+	if baseURL == "" && len(args) > 0 {
+		baseURL = args[0]
+	}
+	if outputFile == "" && len(args) > 1 {
+		outputFile = args[1]
+	}
+
+	if baseURL == "" || outputFile == "" {
+		log.Fatalf(`Usage: %s -baseurl <url> -output <file.csv> [-mode api|crawl] [-apikey KEY]
+Example (API mode, default):
+  %s -baseurl https://iandiwatching.blogspot.com -output posts.csv -apikey YOUR_KEY
+Example (legacy crawl mode):
+  %s -mode crawl -baseurl https://iandiwatching.blogspot.com -output posts.csv`,
+			os.Args[0], os.Args[0], os.Args[0])
+	}
+
+	startTime := time.Now()
+	var err error
+
+	switch *mode {
+	case "api":
+		err = crawlViaAPI(baseURL, *apiKey, outputFile, *maxResults)
+	case "crawl":
+		err = crawlViaHTML(baseURL, outputFile)
+	default:
+		log.Fatalf(`unknown -mode %q, expected "api" or "crawl"`, *mode)
+	}
+
+	if err != nil {
+		log.Fatalf("error: %v", err)
+	}
+
+	log.Printf("Done in %v.", time.Since(startTime))
 }
