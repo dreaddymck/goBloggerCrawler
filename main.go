@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,10 +18,15 @@ import (
 
 // Post represents the data structure for a blog post, regardless of
 // whether it was retrieved via the Blogger v3 API or HTML crawling.
+// Images/Content are here so future embedded-script widgets (beyond the
+// playlist) have somewhere to pull from without another schema change.
 type Post struct {
-	Title    string
-	VideoURL string
-	Tags     []string
+	Title    string   `json:"title"`
+	URL      string   `json:"url"`
+	VideoURL string   `json:"video_url,omitempty"`
+	Images   []string `json:"images,omitempty"`
+	Content  string   `json:"content,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
 }
 
 // Constants
@@ -127,6 +131,25 @@ func extractVideoFromHTML(htmlContent string) string {
 	return strings.TrimSpace(src)
 }
 
+// extractImagesFromHTML pulls every <img src> out of a post's HTML body,
+// for widgets that want post imagery (carousels, thumbnails, etc.).
+func extractImagesFromHTML(htmlContent string) []string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
+	if err != nil {
+		return nil
+	}
+	var images []string
+	doc.Find("img").Each(func(i int, s *goquery.Selection) {
+		if src, exists := s.Attr("src"); exists {
+			src = strings.TrimSpace(src)
+			if src != "" {
+				images = append(images, src)
+			}
+		}
+	})
+	return images
+}
+
 // ---------------------------------------------------------------------------
 // Primary path: Blogger v3 API
 // ---------------------------------------------------------------------------
@@ -177,7 +200,10 @@ func crawlViaAPI(baseURL, apiKey, outputFile string, maxResults int) error {
 		for _, item := range page.Items {
 			posts = append(posts, Post{
 				Title:    strings.TrimSpace(item.Title),
+				URL:      item.URL,
 				VideoURL: extractVideoFromHTML(item.Content),
+				Images:   extractImagesFromHTML(item.Content),
+				Content:  item.Content,
 				Tags:     item.Labels,
 			})
 		}
@@ -189,7 +215,7 @@ func crawlViaAPI(baseURL, apiKey, outputFile string, maxResults int) error {
 		pageToken = page.NextPageToken
 	}
 
-	return writeToCSV(posts, outputFile)
+	return writeToJSON(posts, outputFile)
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +260,8 @@ func crawlPage(pageURL string, postChan chan<- string, wg *sync.WaitGroup) {
 	}
 }
 
-// extractPostData scrapes title/video/tags from a single post page's HTML.
+// extractPostData scrapes title/video/images/content/tags from a single
+// post page's HTML.
 func extractPostData(postURL string) (Post, error) {
 	doc, err := fetchHTML(postURL)
 	if err != nil {
@@ -244,6 +271,19 @@ func extractPostData(postURL string) (Post, error) {
 	title := doc.Find("h3.post-title").First().Text()
 	videoURL, _ := doc.Find("iframe").First().Attr("src")
 
+	body := doc.Find("div.post-body").First()
+	content, _ := body.Html() // best-effort; empty if theme doesn't use this class
+
+	var images []string
+	body.Find("img").Each(func(i int, s *goquery.Selection) {
+		if src, exists := s.Attr("src"); exists {
+			src = strings.TrimSpace(src)
+			if src != "" {
+				images = append(images, src)
+			}
+		}
+	})
+
 	var tags []string
 	doc.Find("span.post-labels a").Each(func(i int, s *goquery.Selection) {
 		tags = append(tags, strings.TrimSpace(s.Text()))
@@ -251,7 +291,10 @@ func extractPostData(postURL string) (Post, error) {
 
 	return Post{
 		Title:    strings.TrimSpace(title),
+		URL:      postURL,
 		VideoURL: strings.TrimSpace(videoURL),
+		Images:   images,
+		Content:  content,
 		Tags:     tags,
 	}, nil
 }
@@ -301,33 +344,24 @@ func crawlViaHTML(baseURL, outputFile string) error {
 	close(resultsChan)
 	resultsWg.Wait()
 
-	return writeToCSV(posts, outputFile)
+	return writeToJSON(posts, outputFile)
 }
 
 // ---------------------------------------------------------------------------
-// CSV output (shared by both modes)
+// JSON output (shared by both modes)
 // ---------------------------------------------------------------------------
 
-func writeToCSV(posts []Post, filename string) error {
+func writeToJSON(posts []Post, filename string) error {
 	file, err := os.Create(filename)
 	if err != nil {
-		return fmt.Errorf("error creating CSV file: %v", err)
+		return fmt.Errorf("error creating JSON file: %v", err)
 	}
 	defer file.Close()
 
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	header := []string{"Title", "Video URL", "Tags"}
-	if err := writer.Write(header); err != nil {
-		return fmt.Errorf("error writing CSV header: %v", err)
-	}
-
-	for _, post := range posts {
-		row := []string{post.Title, post.VideoURL, strings.Join(post.Tags, ", ")}
-		if err := writer.Write(row); err != nil {
-			return fmt.Errorf("error writing CSV row: %v", err)
-		}
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(posts); err != nil {
+		return fmt.Errorf("error writing JSON: %v", err)
 	}
 
 	return nil
@@ -341,7 +375,7 @@ func main() {
 	mode := flag.String("mode", "api", `Retrieval mode: "api" (Blogger v3 API, default) or "crawl" (legacy HTML scraping fallback)`)
 	apiKey := flag.String("apikey", os.Getenv("BLOGGER_API_KEY"), "Blogger v3 API key (required for -mode=api; defaults to $BLOGGER_API_KEY)")
 	baseURLFlag := flag.String("baseurl", "", "Base URL of the Blogger site (e.g. https://yoursitename.blogspot.com)")
-	outputFlag := flag.String("output", "", "CSV output filename")
+	outputFlag := flag.String("output", "", "JSON output filename")
 	maxResults := flag.Int("maxresults", defaultMaxResults, "Posts per page when using -mode=api (max 500)")
 	flag.Parse()
 
@@ -358,11 +392,11 @@ func main() {
 	}
 
 	if baseURL == "" || outputFile == "" {
-		log.Fatalf(`Usage: %s -baseurl <url> -output <file.csv> [-mode api|crawl] [-apikey KEY]
+		log.Fatalf(`Usage: %s -baseurl <url> -output <file.json> [-mode api|crawl] [-apikey KEY]
 Example (API mode, default):
-  %s -baseurl https://iandiwatching.blogspot.com -output posts.csv -apikey YOUR_KEY
+  %s -baseurl https://iandiwatching.blogspot.com -output posts.json -apikey YOUR_KEY
 Example (legacy crawl mode):
-  %s -mode crawl -baseurl https://iandiwatching.blogspot.com -output posts.csv`,
+  %s -mode crawl -baseurl https://iandiwatching.blogspot.com -output posts.json`,
 			os.Args[0], os.Args[0], os.Args[0])
 	}
 
